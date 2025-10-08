@@ -13,10 +13,11 @@ API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}
 API_KEY = "" 
 
 # Tên các sheet bắt buộc (theo yêu cầu của khách hàng)
+# Đã đổi key sang các ký hiệu viết tắt chuẩn: CDKT, KQHDKD, BCLCTT
 SHEET_NAMES = {
-    'Cân đối kế toán': 'Balance Sheet',
-    'Kết quả hoạt động kinh doanh': 'Income Statement',
-    'báo cáo lưu chuyển tiền tệ': 'Cash Flow Statement'
+    'CDKT': 'Bảng Cân đối Kế toán (Balance Sheet)',
+    'KQHDKD': 'Báo cáo Kết quả Hoạt động Kinh doanh (Income Statement)',
+    'BCLCTT': 'Báo cáo Lưu chuyển Tiền tệ (Cash Flow Statement)'
 }
 
 # --- Hàm Helpers Xử lý Dữ liệu và API ---
@@ -124,7 +125,7 @@ if uploaded_file is not None:
     missing_sheets = []
     
     for key, description in SHEET_NAMES.items():
-        # Tìm kiếm sheet không phân biệt hoa thường
+        # Tìm kiếm sheet không phân biệt hoa thường, cho phép người dùng đặt tên sheet chứa 'cdkt' hoặc 'kqhkd'...
         found_sheet_name = next((sheet for sheet in all_sheets if key.lower() in sheet.lower()), None)
         
         if found_sheet_name:
