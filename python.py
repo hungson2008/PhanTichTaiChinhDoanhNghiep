@@ -1,185 +1,188 @@
-# python.py
-
 import streamlit as st
 import pandas as pd
-from google import genai
-from google.genai.errors import APIError
+import json
+import requests
+import time
+from io import BytesIO
 
-# --- Cấu hình Trang Streamlit ---
+# --- Cấu hình API và Model ---
+# Model sử dụng cho phân tích văn bản và grounding
+MODEL_NAME = "gemini-2.5-flash-preview-05-20"
+API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
+# API Key sẽ được tự động cung cấp trong môi trường Canvas nếu để trống
+API_KEY = "" 
+
+# Tên các sheet bắt buộc (theo yêu cầu của khách hàng)
+SHEET_NAMES = {
+    'Cân đối kế toán': 'Bảng Cân đối Kế toán (Balance Sheet)',
+    'Kết quả hoạt động kinh doanh': 'Báo cáo Kết quả Hoạt động Kinh doanh (Income Statement)',
+    'báo cáo lưu chuyển tiền tệ': 'Báo cáo Lưu chuyển Tiền tệ (Cash Flow Statement)'
+}
+
+# --- Hàm Helpers Xử lý Dữ liệu và API ---
+
+def format_df_to_markdown(df, title):
+    """Chuyển đổi DataFrame thành chuỗi Markdown để đưa vào Prompt."""
+    # Đảm bảo DF chỉ có 2 cột: 'Chỉ tiêu' và 'Số liệu'
+    if df.shape[1] < 2:
+        return f"Không đủ dữ liệu trong sheet: {title}"
+
+    # Đặt tên lại cho 2 cột đầu tiên để dễ đọc
+    df.columns = ['Chỉ tiêu', 'Số liệu'] + list(df.columns[2:])
+    
+    # Giới hạn số lượng hàng để tránh prompt quá dài
+    df_preview = df.head(50) 
+    
+    markdown_table = f"### {title}\n"
+    markdown_table += df_preview.to_markdown(index=False)
+    
+    return markdown_table
+
+def call_gemini_api_with_backoff(user_query, system_prompt, max_retries=5):
+    """
+    Gọi API Gemini với cơ chế Exponential Backoff và Google Search Grounding.
+    """
+    st.info("Đang gọi AI Gemini để phân tích rủi ro. Quá trình này có thể mất vài giây...")
+    
+    # Cấu trúc payload cho API
+    payload = {
+        "contents": [{"parts": [{"text": user_query}]}],
+        # Kích hoạt Google Search để grounding với thông tin mới nhất về quy định ngân hàng
+        "tools": [{"google_search": {}}], 
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+    }
+
+    headers = {'Content-Type': 'application/json'}
+    
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                f"{API_URL}?key={API_KEY}",
+                headers=headers,
+                data=json.dumps(payload)
+            )
+            response.raise_for_status() # Lỗi HTTP sẽ ném ra exception
+            
+            result = response.json()
+            candidate = result.get('candidates', [{}])[0]
+            
+            # Trích xuất nội dung và nguồn grounding
+            text = candidate.get('content', {}).get('parts', [{}])[0].get('text', '')
+            
+            sources = []
+            grounding_metadata = candidate.get('groundingMetadata')
+            if grounding_metadata and grounding_metadata.get('groundingAttributions'):
+                sources = grounding_metadata['groundingAttributions']
+                
+            return text, sources
+            
+        except requests.exceptions.RequestException as e:
+            st.warning(f"Lỗi API (lần {attempt + 1}): {e}. Đang thử lại...")
+            if attempt < max_retries - 1:
+                # Dừng lại theo cấp số nhân (1s, 2s, 4s, ...)
+                time.sleep(2 ** attempt) 
+            else:
+                return f"Đã thất bại sau {max_retries} lần thử: Không thể kết nối với dịch vụ AI.", []
+        except Exception as e:
+             return f"Lỗi không xác định: {e}", []
+
+# --- Logic Ứng dụng Streamlit ---
+
 st.set_page_config(
-    page_title="App Phân Tích Báo Cáo Tài Chính",
-    layout="wide"
+    page_title="Phân tích Tài chính Doanh nghiệp (AI-Powered)",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-st.title("Ứng dụng Phân Tích Báo Cáo Tài Chính 📊")
+st.title("🤖 Ứng dụng Phân tích Rủi ro Tín dụng Doanh nghiệp")
+st.markdown("Sử dụng Gemini AI và Google Search Grounding để phân tích Báo cáo Tài chính của khách hàng theo chuẩn Ngân hàng.")
 
-# --- Hàm tính toán chính (Sử dụng Caching để Tối ưu hiệu suất) ---
-@st.cache_data
-def process_financial_data(df):
-    """Thực hiện các phép tính Tăng trưởng và Tỷ trọng."""
-    
-    # Đảm bảo các giá trị là số để tính toán
-    numeric_cols = ['Năm trước', 'Năm sau']
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-    
-    # 1. Tính Tốc độ Tăng trưởng
-    # Dùng .replace(0, 1e-9) cho Series Pandas để tránh lỗi chia cho 0
-    df['Tốc độ tăng trưởng (%)'] = (
-        (df['Năm sau'] - df['Năm trước']) / df['Năm trước'].replace(0, 1e-9)
-    ) * 100
+# Khởi tạo state để lưu trữ kết quả
+if 'analysis_result' not in st.session_state:
+    st.session_state.analysis_result = None
+if 'sources' not in st.session_state:
+    st.session_state.sources = []
 
-    # 2. Tính Tỷ trọng theo Tổng Tài sản
-    # Lọc chỉ tiêu "TỔNG CỘNG TÀI SẢN"
-    tong_tai_san_row = df[df['Chỉ tiêu'].str.contains('TỔNG CỘNG TÀI SẢN', case=False, na=False)]
-    
-    if tong_tai_san_row.empty:
-        raise ValueError("Không tìm thấy chỉ tiêu 'TỔNG CỘNG TÀI SẢN'.")
-
-    tong_tai_san_N_1 = tong_tai_san_row['Năm trước'].iloc[0]
-    tong_tai_san_N = tong_tai_san_row['Năm sau'].iloc[0]
-
-    # ******************************* PHẦN SỬA LỖI BẮT ĐẦU *******************************
-    # Lỗi xảy ra khi dùng .replace() trên giá trị đơn lẻ (numpy.int64).
-    # Sử dụng điều kiện ternary để xử lý giá trị 0 thủ công cho mẫu số.
-    
-    divisor_N_1 = tong_tai_san_N_1 if tong_tai_san_N_1 != 0 else 1e-9
-    divisor_N = tong_tai_san_N if tong_tai_san_N != 0 else 1e-9
-
-    # Tính tỷ trọng với mẫu số đã được xử lý
-    df['Tỷ trọng Năm trước (%)'] = (df['Năm trước'] / divisor_N_1) * 100
-    df['Tỷ trọng Năm sau (%)'] = (df['Năm sau'] / divisor_N) * 100
-    # ******************************* PHẦN SỬA LỖI KẾT THÚC *******************************
-    
-    return df
-
-# --- Hàm gọi API Gemini ---
-def get_ai_analysis(data_for_ai, api_key):
-    """Gửi dữ liệu phân tích đến Gemini API và nhận nhận xét."""
-    try:
-        client = genai.Client(api_key=api_key)
-        model_name = 'gemini-2.5-flash' 
-
-        prompt = f"""
-        Bạn là một chuyên gia phân tích tài chính chuyên nghiệp. Dựa trên các chỉ số tài chính sau, hãy đưa ra một nhận xét khách quan, ngắn gọn (khoảng 3-4 đoạn) về tình hình tài chính của doanh nghiệp. Đánh giá tập trung vào tốc độ tăng trưởng, thay đổi cơ cấu tài sản và khả năng thanh toán hiện hành.
-        
-        Dữ liệu thô và chỉ số:
-        {data_for_ai}
-        """
-
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt
-        )
-        return response.text
-
-    except APIError as e:
-        return f"Lỗi gọi Gemini API: Vui lòng kiểm tra Khóa API hoặc giới hạn sử dụng. Chi tiết lỗi: {e}"
-    except KeyError:
-        return "Lỗi: Không tìm thấy Khóa API 'GEMINI_API_KEY'. Vui lòng kiểm tra cấu hình Secrets trên Streamlit Cloud."
-    except Exception as e:
-        return f"Đã xảy ra lỗi không xác định: {e}"
-
-
-# --- Chức năng 1: Tải File ---
 uploaded_file = st.file_uploader(
-    "1. Tải file Excel Báo cáo Tài chính (Chỉ tiêu | Năm trước | Năm sau)",
-    type=['xlsx', 'xls']
+    "Tải lên file Báo cáo Tài chính (Excel .xlsx)", 
+    type=["xlsx"]
 )
 
 if uploaded_file is not None:
+    st.success(f"File **{uploaded_file.name}** đã được tải lên.")
+    
+    # Đọc tất cả các sheet vào một dictionary
     try:
-        df_raw = pd.read_excel(uploaded_file)
-        
-        # Tiền xử lý: Đảm bảo chỉ có 3 cột quan trọng
-        df_raw.columns = ['Chỉ tiêu', 'Năm trước', 'Năm sau']
-        
-        # Xử lý dữ liệu
-        df_processed = process_financial_data(df_raw.copy())
-
-        if df_processed is not None:
-            
-            # --- Chức năng 2 & 3: Hiển thị Kết quả ---
-            st.subheader("2. Tốc độ Tăng trưởng & 3. Tỷ trọng Cơ cấu Tài sản")
-            st.dataframe(df_processed.style.format({
-                'Năm trước': '{:,.0f}',
-                'Năm sau': '{:,.0f}',
-                'Tốc độ tăng trưởng (%)': '{:.2f}%',
-                'Tỷ trọng Năm trước (%)': '{:.2f}%',
-                'Tỷ trọng Năm sau (%)': '{:.2f}%'
-            }), use_container_width=True)
-            
-            # --- Chức năng 4: Tính Chỉ số Tài chính ---
-            st.subheader("4. Các Chỉ số Tài chính Cơ bản")
-            
-            try:
-                # Lọc giá trị cho Chỉ số Thanh toán Hiện hành (Ví dụ)
-                
-                # Lấy Tài sản ngắn hạn
-                tsnh_n = df_processed[df_processed['Chỉ tiêu'].str.contains('TÀI SẢN NGẮN HẠN', case=False, na=False)]['Năm sau'].iloc[0]
-                tsnh_n_1 = df_processed[df_processed['Chỉ tiêu'].str.contains('TÀI SẢN NGẮN HẠN', case=False, na=False)]['Năm trước'].iloc[0]
-
-                # Lấy Nợ ngắn hạn (Dùng giá trị giả định hoặc lọc từ file nếu có)
-                # **LƯU Ý: Thay thế logic sau nếu bạn có Nợ Ngắn Hạn trong file**
-                no_ngan_han_N = df_processed[df_processed['Chỉ tiêu'].str.contains('NỢ NGẮN HẠN', case=False, na=False)]['Năm sau'].iloc[0]  
-                no_ngan_han_N_1 = df_processed[df_processed['Chỉ tiêu'].str.contains('NỢ NGẮN HẠN', case=False, na=False)]['Năm trước'].iloc[0]
-
-                # Tính toán
-                thanh_toan_hien_hanh_N = tsnh_n / no_ngan_han_N
-                thanh_toan_hien_hanh_N_1 = tsnh_n_1 / no_ngan_han_N_1
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric(
-                        label="Chỉ số Thanh toán Hiện hành (Năm trước)",
-                        value=f"{thanh_toan_hien_hanh_N_1:.2f} lần"
-                    )
-                with col2:
-                    st.metric(
-                        label="Chỉ số Thanh toán Hiện hành (Năm sau)",
-                        value=f"{thanh_toan_hien_hanh_N:.2f} lần",
-                        delta=f"{thanh_toan_hien_hanh_N - thanh_toan_hien_hanh_N_1:.2f}"
-                    )
-                    
-            except IndexError:
-                 st.warning("Thiếu chỉ tiêu 'TÀI SẢN NGẮN HẠN' hoặc 'NỢ NGẮN HẠN' để tính chỉ số.")
-                 thanh_toan_hien_hanh_N = "N/A" # Dùng để tránh lỗi ở Chức năng 5
-                 thanh_toan_hien_hanh_N_1 = "N/A"
-            
-            # --- Chức năng 5: Nhận xét AI ---
-            st.subheader("5. Nhận xét Tình hình Tài chính (AI)")
-            
-            # Chuẩn bị dữ liệu để gửi cho AI
-            data_for_ai = pd.DataFrame({
-                'Chỉ tiêu': [
-                    'Toàn bộ Bảng phân tích (dữ liệu thô)', 
-                    'Tăng trưởng Tài sản ngắn hạn (%)', 
-                    'Thanh toán hiện hành (N-1)', 
-                    'Thanh toán hiện hành (N)'
-                ],
-                'Giá trị': [
-                    df_processed.to_markdown(index=False),
-                    f"{df_processed[df_processed['Chỉ tiêu'].str.contains('TÀI SẢN NGẮN HẠN', case=False, na=False)]['Tốc độ tăng trưởng (%)'].iloc[0]:.2f}%", 
-                    f"{thanh_toan_hien_hanh_N_1}", 
-                    f"{thanh_toan_hien_hanh_N}"
-                ]
-            }).to_markdown(index=False) 
-
-            if st.button("Yêu cầu AI Phân tích"):
-                api_key = st.secrets.get("GEMINI_API_KEY") 
-                
-                if api_key:
-                    with st.spinner('Đang gửi dữ liệu và chờ Gemini phân tích...'):
-                        ai_result = get_ai_analysis(data_for_ai, api_key)
-                        st.markdown("**Kết quả Phân tích từ Gemini AI:**")
-                        st.info(ai_result)
-                else:
-                     st.error("Lỗi: Không tìm thấy Khóa API. Vui lòng cấu hình Khóa 'GEMINI_API_KEY' trong Streamlit Secrets.")
-
-    except ValueError as ve:
-        st.error(f"Lỗi cấu trúc dữ liệu: {ve}")
+        xls = pd.ExcelFile(uploaded_file)
+        all_sheets = {sheet: xls.parse(sheet).dropna(how='all') for sheet in xls.sheet_names}
     except Exception as e:
-        st.error(f"Có lỗi xảy ra khi đọc hoặc xử lý file: {e}. Vui lòng kiểm tra định dạng file.")
+        st.error(f"Lỗi khi đọc file Excel: {e}")
+        st.stop()
 
-else:
+    # Xác định các sheet cần thiết và chuẩn bị dữ liệu
+    financial_data = {}
+    missing_sheets = []
+    
+    for key, description in SHEET_NAMES.items():
+        # Tìm kiếm sheet không phân biệt hoa thường
+        found_sheet_name = next((sheet for sheet in all_sheets if key.lower() in sheet.lower()), None)
+        
+        if found_sheet_name:
+            df = all_sheets[found_sheet_name]
+            financial_data[key] = format_df_to_markdown(df, description)
+        else:
+            missing_sheets.append(description)
+
+    if missing_sheets:
+        st.warning(f"⚠️ Thiếu các sheet bắt buộc: **{', '.join(missing_sheets)}**. Vui lòng kiểm tra lại tên sheet.")
+        st.stop()
+    
+    # --- Xây dựng Prompt và Hệ thống ---
+    
+    # 1. System Instruction (Hướng dẫn vai trò cho AI)
+    system_prompt = (
+        "Bạn là một chuyên gia phân tích tín dụng và tài chính doanh nghiệp hàng đầu, có kinh nghiệm sâu sắc về các quy định cho vay của ngành ngân hàng Việt Nam. "
+        "Nhiệm vụ của bạn là phân tích chi tiết các Báo cáo Tài chính (Cân đối kế toán, Kết quả kinh doanh, Lưu chuyển tiền tệ) được cung cấp. "
+        "Dựa trên phân tích, bạn phải đưa ra một đánh giá tổng quan về tình hình tài chính của doanh nghiệp và **chỉ ra 3 đến 5 rủi ro trọng yếu nhất** mà ngân hàng cần xem xét khi quyết định cho vay. "
+        "Đặc biệt chú trọng đến các chỉ số thanh khoản, đòn bẩy, khả năng sinh lời và dòng tiền. "
+        "Phản hồi phải bằng tiếng Việt, có cấu trúc rõ ràng với các phần: **1. Đánh giá Tổng quan** và **2. Các Rủi ro Trọng yếu** (sử dụng dấu gạch đầu dòng)."
+    )
+    
+    # 2. User Query (Dữ liệu đầu vào cho AI)
+    user_query = "Dưới đây là Dữ liệu Báo cáo Tài chính của khách hàng. Hãy thực hiện phân tích và nhận diện rủi ro theo hướng dẫn:\n\n"
+    
+    for key, data_markdown in financial_data.items():
+        user_query += f"{data_markdown}\n\n"
+        
+    st.subheader("Dữ liệu đã sẵn sàng để phân tích:")
+    st.code(f"Kích thước Prompt: {len(user_query)} ký tự. (Chỉ 50 dòng đầu tiên của mỗi sheet được gửi)", language='text')
+
+    
+    if st.button("🚀 Phân tích Rủi ro Tín dụng bằng AI", type="primary"):
+        with st.spinner('Đang phân tích sâu...'):
+            st.session_state.analysis_result, st.session_state.sources = call_gemini_api_with_backoff(
+                user_query, 
+                system_prompt
+            )
+        st.success("Phân tích hoàn tất!")
+
+# --- Hiển thị Kết quả ---
+
+if st.session_state.analysis_result:
+    st.divider()
+    st.header("Kết quả Phân tích Rủi ro từ AI")
+    st.markdown(st.session_state.analysis_result)
+
+    if st.session_state.sources:
+        st.subheader("Nguồn tham khảo (Grounding)")
+        st.markdown("AI đã tham khảo thông tin cập nhật từ các nguồn sau để đảm bảo tính chính xác theo quy định:")
+        
+        source_markdown = ""
+        for i, source in enumerate(st.session_state.sources):
+            if source.get('title') and source.get('uri'):
+                source_markdown += f"- [{source['title']}]({source['uri']})\n"
+        st.markdown(source_markdown)
+    else:
+        st.info("Không có nguồn Grounding nào được trích dẫn (do yêu cầu phân tích dữ liệu chuyên sâu, không phải tìm kiếm thông tin).")
+elif uploaded_file is None:
     st.info("Vui lòng tải lên file Excel để bắt đầu phân tích.")
