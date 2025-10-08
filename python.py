@@ -14,9 +14,9 @@ API_KEY = ""
 
 # Tên các sheet bắt buộc (theo yêu cầu của khách hàng)
 SHEET_NAMES = {
-    'Cân đối kế toán': 'Bảng Cân đối Kế toán (Balance Sheet)',
-    'Kết quả hoạt động kinh doanh': 'Báo cáo Kết quả Hoạt động Kinh doanh (Income Statement)',
-    'báo cáo lưu chuyển tiền tệ': 'Báo cáo Lưu chuyển Tiền tệ (Cash Flow Statement)'
+    'Cân đối kế toán': 'Balance Sheet',
+    'Kết quả hoạt động kinh doanh': 'Income Statement',
+    'báo cáo lưu chuyển tiền tệ': 'Cash Flow Statement'
 }
 
 # --- Hàm Helpers Xử lý Dữ liệu và API ---
