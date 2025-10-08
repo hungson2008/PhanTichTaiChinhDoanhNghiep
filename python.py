@@ -55,10 +55,15 @@ def call_gemini_api_with_backoff(user_query, system_prompt, max_retries=5):
 
     headers = {'Content-Type': 'application/json'}
     
+    # Xử lý URL: chỉ thêm API key nếu nó tồn tại, nếu không sẽ dựa vào môi trường Canvas để xác thực
+    request_url = API_URL
+    if API_KEY:
+        request_url = f"{API_URL}?key={API_KEY}"
+        
     for attempt in range(max_retries):
         try:
             response = requests.post(
-                f"{API_URL}?key={API_KEY}",
+                request_url, # Sử dụng request_url đã được xây dựng
                 headers=headers,
                 data=json.dumps(payload)
             )
@@ -78,6 +83,11 @@ def call_gemini_api_with_backoff(user_query, system_prompt, max_retries=5):
             return text, sources
             
         except requests.exceptions.RequestException as e:
+            # Bắt lỗi 403 cụ thể (thường là lỗi xác thực)
+            if 'response' in locals() and response.status_code == 403:
+                st.error("Lỗi 403 Forbidden: Lỗi xác thực (API Key). Vui lòng kiểm tra lại cấu hình môi trường hoặc API Key.")
+                return f"Đã thất bại: Lỗi xác thực (403 Forbidden).", []
+
             st.warning(f"Lỗi API (lần {attempt + 1}): {e}. Đang thử lại...")
             if attempt < max_retries - 1:
                 # Dừng lại theo cấp số nhân (1s, 2s, 4s, ...)
